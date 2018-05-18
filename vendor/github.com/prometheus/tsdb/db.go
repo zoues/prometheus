@@ -19,16 +19,15 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"math"
 	"os"
 	"path/filepath"
 	"runtime"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
-	"unsafe"
-
-	"golang.org/x/sync/errgroup"
 
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
@@ -39,6 +38,8 @@ import (
 	"github.com/prometheus/tsdb/chunkenc"
 	"github.com/prometheus/tsdb/fileutil"
 	"github.com/prometheus/tsdb/labels"
+	"github.com/prometheus/tsdb/wal"
+	"golang.org/x/sync/errgroup"
 )
 
 // DefaultOptions used for the DB. They are sane for setups using
@@ -225,18 +226,18 @@ func Open(dir string, l log.Logger, r prometheus.Registerer, opts *Options) (db 
 		return nil, errors.Wrap(err, "create leveled compactor")
 	}
 
-	wal, err := OpenSegmentWAL(filepath.Join(dir, "wal"), l, opts.WALFlushInterval, r)
+	wlog, err := wal.New(l, r, filepath.Join(dir, "wal"))
 	if err != nil {
 		return nil, err
 	}
-	db.head, err = NewHead(r, l, wal, opts.BlockRanges[0])
+	db.head, err = NewHead(r, l, wlog, opts.BlockRanges[0])
 	if err != nil {
 		return nil, err
 	}
 	if err := db.reload(); err != nil {
 		return nil, err
 	}
-	if err := db.head.ReadWAL(); err != nil {
+	if err := db.head.Init(); err != nil {
 		return nil, errors.Wrap(err, "read WAL")
 	}
 
@@ -522,7 +523,9 @@ func (db *DB) reload(deleteable ...string) (err error) {
 		blocks = append(blocks, b)
 		exist[meta.ULID] = struct{}{}
 	}
-
+	sort.Slice(blocks, func(i, j int) bool {
+		return blocks[i].Meta().MinTime < blocks[j].Meta().MinTime
+	})
 	if err := validateBlockSequence(blocks); err != nil {
 		return errors.Wrap(err, "invalid block sequence")
 	}
@@ -556,20 +559,123 @@ func (db *DB) reload(deleteable ...string) (err error) {
 	return errors.Wrap(db.head.Truncate(maxt), "head truncate failed")
 }
 
+// validateBlockSequence returns error if given block meta files indicate that some blocks overlaps within sequence.
 func validateBlockSequence(bs []*Block) error {
-	if len(bs) == 0 {
+	if len(bs) <= 1 {
 		return nil
 	}
-	sort.Slice(bs, func(i, j int) bool {
-		return bs[i].Meta().MinTime < bs[j].Meta().MinTime
-	})
-	prev := bs[0]
-	for _, b := range bs[1:] {
-		if b.Meta().MinTime < prev.Meta().MaxTime {
-			return errors.Errorf("block time ranges overlap (%d, %d)", b.Meta().MinTime, prev.Meta().MaxTime)
-		}
+
+	var metas []BlockMeta
+	for _, b := range bs {
+		metas = append(metas, b.meta)
 	}
+
+	overlaps := OverlappingBlocks(metas)
+	if len(overlaps) > 0 {
+		return errors.Errorf("block time ranges overlap: %s", overlaps)
+	}
+
 	return nil
+}
+
+// TimeRange specifies minTime and maxTime range.
+type TimeRange struct {
+	Min, Max int64
+}
+
+// Overlaps contains overlapping blocks aggregated by overlapping range.
+type Overlaps map[TimeRange][]BlockMeta
+
+// String returns human readable string form of overlapped blocks.
+func (o Overlaps) String() string {
+	var res []string
+	for r, overlaps := range o {
+		var groups []string
+		for _, m := range overlaps {
+			groups = append(groups, fmt.Sprintf(
+				"<ulid: %s, mint: %d, maxt: %d, range: %s>",
+				m.ULID.String(),
+				m.MinTime,
+				m.MaxTime,
+				(time.Duration((m.MaxTime-m.MinTime)/1000)*time.Second).String(),
+			))
+		}
+		res = append(res, fmt.Sprintf(
+			"[mint: %d, maxt: %d, range: %s, blocks: %d]: %s",
+			r.Min, r.Max,
+			(time.Duration((r.Max-r.Min)/1000)*time.Second).String(),
+			len(overlaps),
+			strings.Join(groups, ", ")),
+		)
+	}
+	return strings.Join(res, "\n")
+}
+
+// OverlappingBlocks returns all overlapping blocks from given meta files.
+func OverlappingBlocks(bm []BlockMeta) Overlaps {
+	if len(bm) <= 1 {
+		return nil
+	}
+	var (
+		overlaps [][]BlockMeta
+
+		// pending contains not ended blocks in regards to "current" timestamp.
+		pending = []BlockMeta{bm[0]}
+		// continuousPending helps to aggregate same overlaps to single group.
+		continuousPending = true
+	)
+
+	// We have here blocks sorted by minTime. We iterate over each block and treat its minTime as our "current" timestamp.
+	// We check if any of the pending block finished (blocks that we have seen before, but their maxTime was still ahead current
+	// timestamp). If not, it means they overlap with our current block. In the same time current block is assumed pending.
+	for _, b := range bm[1:] {
+		var newPending []BlockMeta
+
+		for _, p := range pending {
+			// "b.MinTime" is our current time.
+			if b.MinTime >= p.MaxTime {
+				continuousPending = false
+				continue
+			}
+
+			// "p" overlaps with "b" and "p" is still pending.
+			newPending = append(newPending, p)
+		}
+
+		// Our block "b" is now pending.
+		pending = append(newPending, b)
+		if len(newPending) == 0 {
+			// No overlaps.
+			continue
+		}
+
+		if continuousPending && len(overlaps) > 0 {
+			overlaps[len(overlaps)-1] = append(overlaps[len(overlaps)-1], b)
+			continue
+		}
+		overlaps = append(overlaps, append(newPending, b))
+		// Start new pendings.
+		continuousPending = true
+	}
+
+	// Fetch the critical overlapped time range foreach overlap groups.
+	overlapGroups := Overlaps{}
+	for _, overlap := range overlaps {
+
+		minRange := TimeRange{Min: 0, Max: math.MaxInt64}
+		for _, b := range overlap {
+			if minRange.Max > b.MaxTime {
+				minRange.Max = b.MaxTime
+			}
+
+			if minRange.Min < b.MinTime {
+				minRange.Min = b.MinTime
+			}
+		}
+		overlapGroups[minRange] = overlap
+	}
+
+	return overlapGroups
 }
 
 func (db *DB) String() string {
@@ -725,10 +831,7 @@ func (db *DB) Delete(mint, maxt int64, ms ...labels.Matcher) error {
 	g.Go(func() error {
 		return db.head.Delete(mint, maxt, ms...)
 	})
-	if err := g.Wait(); err != nil {
-		return err
-	}
-	return nil
+	return g.Wait()
 }
 
 // CleanTombstones re-writes any blocks with tombstones.
@@ -737,7 +840,7 @@ func (db *DB) CleanTombstones() error {
 	defer db.cmtx.Unlock()
 
 	start := time.Now()
-	defer db.metrics.tombCleanTimer.Observe(float64(time.Since(start).Seconds()))
+	defer db.metrics.tombCleanTimer.Observe(time.Since(start).Seconds())
 
 	db.mtx.RLock()
 	blocks := db.blocks[:]
@@ -765,10 +868,6 @@ func (db *DB) CleanTombstones() error {
 func intervalOverlap(amin, amax, bmin, bmax int64) bool {
 	// Checks Overlap: http://stackoverflow.com/questions/3269434/
 	return amin <= bmax && bmin <= amax
-}
-
-func intervalContains(min, max, t int64) bool {
-	return t >= min && t <= max
 }
 
 func isBlockDir(fi os.FileInfo) bool {
@@ -868,9 +967,6 @@ func (es MultiError) Err() error {
 	}
 	return es
 }
-
-func yoloString(b []byte) string { return *((*string)(unsafe.Pointer(&b))) }
-func yoloBytes(s string) []byte  { return *((*[]byte)(unsafe.Pointer(&s))) }
 
 func closeAll(cs ...io.Closer) error {
 	var merr MultiError
