@@ -124,10 +124,11 @@ const (
 	nodeLabelPrefix      = metaLabelPrefix + "node_label_"
 	nodeAnnotationPrefix = metaLabelPrefix + "node_annotation_"
 	nodeAddressPrefix    = metaLabelPrefix + "node_address_"
+	nodeUID              = "uid"
 )
 
 func nodeLabels(n *apiv1.Node) model.LabelSet {
-	ls := make(model.LabelSet, len(n.Labels)+len(n.Annotations)+1)
+	ls := make(model.LabelSet, len(n.Labels)+len(n.Annotations)+2)
 
 	ls[nodeNameLabel] = lv(n.Name)
 
@@ -140,6 +141,9 @@ func nodeLabels(n *apiv1.Node) model.LabelSet {
 		ln := strutil.SanitizeLabelName(nodeAnnotationPrefix + k)
 		ls[model.LabelName(ln)] = lv(v)
 	}
+
+	ln := strutil.SanitizeLabelName(nodeUID)
+	ls[model.LabelName(ln)] = lv(string(n.UID))
 	return ls
 }
 
